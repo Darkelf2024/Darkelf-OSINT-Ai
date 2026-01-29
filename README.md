@@ -52,6 +52,7 @@ pip install -r requirements.txt
 - Python 3.9 or newer
 - Internet access for OSINT sources
 - API keys if configured for external services
+- brew install Ollama
 
 ---
 
