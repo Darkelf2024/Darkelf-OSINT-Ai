@@ -2,6 +2,7 @@
 
 import sys
 import json
+import shutil
 import socket
 import subprocess  # nosec B404
 import requests
