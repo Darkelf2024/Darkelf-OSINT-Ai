@@ -3,7 +3,7 @@
 import sys
 import json
 import socket
-import subprocess
+import subprocess  # nosec B404
 import requests
 import re
 import textwrap
@@ -48,30 +48,36 @@ ASCII_ART = r"""
 # DATA MODELS
 # ============================================================
 
+
 @dataclass
 class SearchResult:
     title: str
     url: str
     snippet: str
 
+
 # ============================================================
 # NETWORK CHECKS
 # ============================================================
 
+
 def new_session():
     """Create a new HTTP session with specific headers."""
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://duckduckgo.com/"
-    })
+    s.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://duckduckgo.com/",
+        }
+    )
     return s
-    
+
+
 def check_online():
     """Check the system's online status."""
     global online
@@ -81,16 +87,18 @@ def check_online():
     except requests.RequestException:
         online = False
 
+
 def net_status():
     """Return online/offline status as a nicely formatted string."""
     return "[green]ONLINE[/green]" if online else "[red]OFFLINE[/red]"
+
 
 # ============================================================
 # AI ENGINE
 # ============================================================
 
 def ai_stream(prompt: str, mode="OSINT", return_text=False):
-    """Stream AI results using the Ollama command, optionally returning full text."""
+    """Stream AI results using Ollama safely, optionally returning full text."""
 
     identity = (
         "You are Darkelf OSINT AI.\n"
@@ -104,39 +112,119 @@ def ai_stream(prompt: str, mode="OSINT", return_text=False):
     )
 
     full_prompt = identity + "\n" + prompt
-    cmd = ["ollama", "run", OLLAMA_MODEL, full_prompt]
+
+    # --- Resolve ollama binary safely ---
+    ollama_bin = shutil.which("ollama")
+    if not ollama_bin:
+        console.print("[red]Ollama not found in PATH[/red]")
+        return None
+
+    # --- Validate model ---
+    ALLOWED_MODELS = {"llama3", "mistral", "mixtral"}
+    if OLLAMA_MODEL not in ALLOWED_MODELS:
+        console.print(f"[red]Invalid model: {OLLAMA_MODEL}[/red]")
+        return None
+
+    # --- Normalize + limit prompt ---
+    try:
+        full_prompt = full_prompt.encode("utf-8", errors="ignore").decode()
+    except Exception as e:
+        console.print(f"[red]Prompt encoding failed:[/red] {e}")
+        return None
+
+    if len(full_prompt) > 20000:
+        console.print("[red]Prompt too large[/red]")
+        return None
 
     text = Text()
-    collected_output = ""  # 🔐 Capture AI output here
+    collected_output = ""
 
     with Live(text, refresh_per_second=8, console=console):
+        proc = None
         try:
-            proc = subprocess.Popen(
-                cmd,
+            proc = subprocess.Popen(  # nosec B603
+                [ollama_bin, "run", OLLAMA_MODEL],
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                bufsize=1,
             )
 
-            for line in proc.stdout:
-                text.append(line)
-                collected_output += line
+            # --- Send prompt ---
+            try:
+                proc.stdin.write(full_prompt)
+                proc.stdin.close()
+            except Exception as e:
+                console.print(f"[red]Failed to send prompt to AI:[/red] {e}")
+                if proc:
+                    proc.kill()
+                return None
 
-            proc.wait()
+            # --- Stream output ---
+            try:
+                for line in iter(proc.stdout.readline, ""):
+                    if not line:
+                        break
+                    text.append(line)
+                    collected_output += line
+            except Exception as e:
+                console.print(f"[red]Error reading AI output:[/red] {e}")
+                if proc:
+                    proc.kill()
+                return None
 
+            # --- Close stdout cleanly ---
+            try:
+                proc.stdout.close()
+            except Exception as e:
+                console.print(f"[yellow]Warning closing stdout:[/yellow] {e}")
+
+            # --- Wait with timeout ---
+            try:
+                proc.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                console.print("[red]AI timed out[/red]")
+                if proc:
+                    proc.kill()
+                return None
+
+            # --- Handle non-zero exit ---
             if proc.returncode != 0:
-                error_msg = proc.stderr.read()
-                console.print(f"[red]AI Error:[/red] {error_msg}")
+                try:
+                    err = proc.stderr.read().strip()
+                except Exception as e:
+                    err = f"Failed to read stderr: {e}"
+
+                console.print(f"[red]AI Error:[/red] {err or 'Unknown error'}")
+                return None
 
         except Exception as e:
-            console.print(f"[red]Failed to execute AI command: {e}[/red]")
+            console.print(f"[red]Execution failed:[/red] {e}")
+            if proc:
+                proc.kill()
+            return None
+
+        finally:
+            # --- Ensure cleanup ---
+            if proc:
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                    if proc.stderr:
+                        proc.stderr.close()
+                except Exception as e:
+                    console.print(f"[yellow]Cleanup warning:[/yellow] {e}")
 
     if return_text:
-        return collected_output
-        
+        return collected_output.strip()
+
+    return None
+
 # ============================================================
 # DUCKDUCKGO SEARCH (WORKING METHOD)
 # ============================================================
+
 
 def ddg_search(query: str, max_results=8) -> List[SearchResult]:
     console.print("[dim]Searching DuckDuckGo (live)...[/dim]")
@@ -157,11 +245,12 @@ def ddg_search(query: str, max_results=8) -> List[SearchResult]:
             SearchResult(
                 title=title.get_text(strip=True),
                 url=link["href"],
-                snippet=snippet.get_text(strip=True) if snippet else ""
+                snippet=snippet.get_text(strip=True) if snippet else "",
             )
         )
     return results
-    
+
+
 def fetch_page_text(url: str, max_chars=4000) -> str:
     try:
         r = new_session().get(url, timeout=10)
@@ -176,6 +265,7 @@ def fetch_page_text(url: str, max_chars=4000) -> str:
         return text[:max_chars]
     except Exception as e:
         return f"Failed to fetch page content: {e}"
+
 
 def clean_snippet(text: str, max_len=220) -> str:
     if not text:
@@ -193,6 +283,7 @@ def format_page_text(text: str, width=90) -> str:
         paragraphs.append(textwrap.fill(block, width=width))
     return "\n\n".join(paragraphs)
 
+
 def show_results(results: List[SearchResult]):
     """Display DuckDuckGo search results and handle user interactions."""
     if not results:
@@ -202,9 +293,7 @@ def show_results(results: List[SearchResult]):
 
     # Render results table
     table = Table(
-        title="DuckDuckGo Search Results",
-        border_style="green",
-        show_lines=True
+        title="DuckDuckGo Search Results", border_style="green", show_lines=True
     )
     table.add_column("#", width=3, justify="right")
     table.add_column("Title", style="cyan", no_wrap=True)
@@ -212,12 +301,7 @@ def show_results(results: List[SearchResult]):
     table.add_column("Snippet", overflow="fold", style="dim")
 
     for i, result in enumerate(results, 1):
-        table.add_row(
-            str(i),
-            result.title,
-            result.url,
-            clean_snippet(result.snippet)
-        )
+        table.add_row(str(i), result.title, result.url, clean_snippet(result.snippet))
 
     console.print(table)
     console.print(
@@ -239,11 +323,15 @@ def show_results(results: List[SearchResult]):
 
                 console.print(
                     Panel(
-                        formatted[:2500] if formatted else "No readable content extracted.",
+                        (
+                            formatted[:2500]
+                            if formatted
+                            else "No readable content extracted."
+                        ),
                         title=f"Reader View: {results[idx].title}",
                         subtitle=results[idx].url,
                         border_style="cyan",
-                        padding=(1, 2)
+                        padding=(1, 2),
                     )
                 )
             else:
@@ -272,7 +360,7 @@ Analyze:
 - OSINT relevance
 - Potential investigative pivots
 """,
-                    mode="ATTRIBUTION"
+                    mode="ATTRIBUTION",
                 )
             else:
                 console.print("[red]Invalid selection[/red]")
@@ -280,17 +368,16 @@ Analyze:
         else:
             console.print("[yellow]Invalid command[/yellow]")
 
+
 # ============================================================
 # OPTION 3: USERNAME ENUMERATION
 # ============================================================
 
+
 def username_enum():
     u = Prompt.ask("Username").strip()
 
-    table = Table(
-        title=f"Username OSINT Enumeration: {u}",
-        border_style="cyan"
-    )
+    table = Table(title=f"Username OSINT Enumeration: {u}", border_style="cyan")
     table.add_column("Platform")
     table.add_column("URL")
     table.add_column("Status")
@@ -342,7 +429,11 @@ def username_enum():
     console.print(table)
 
     # --- AI ANALYSIS ---
-    if findings and Prompt.ask("Run Darkelf OSINT AI attribution analysis? (y/n)").lower() == "y":
+    if (
+        findings
+        and Prompt.ask("Run Darkelf OSINT AI attribution analysis? (y/n)").lower()
+        == "y"
+    ):
         ai_stream(
             f"""
 You are an OSINT analyst.
@@ -361,12 +452,14 @@ Analyze:
 
 Provide a confidence score (0–100).
 """,
-            mode="ATTRIBUTION"
+            mode="ATTRIBUTION",
         )
+
 
 # ============================================================
 # OPTION 4: DOMAIN/IP ENRICHMENT
 # ============================================================
+
 
 def domain_ip_enrich():
     """Fetch IP/domain information and analyze it."""
@@ -396,23 +489,34 @@ def domain_ip_enrich():
         if Prompt.ask("Run Darkelf OSINT AI risk analysis? (y/n)").lower() == "y":
             ai_stream(
                 f"Analyze the network footprint, risks, and attribution of the domain/IP: {target}",
-                mode="OSINT"
+                mode="OSINT",
             )
     except requests.RequestException as e:
         console.print(f"[red]Failed to fetch IP information: {e}[/red]")
-        
+
+
 # ============================================================
 # OSINT CHALLENGES
 # ============================================================
 
 CHALLENGES = [
-    ("Beginner", "Username reuse",
-     "Correlating identities across platforms using usernames."),
-    ("Intermediate", "Image verification",
-     "Verifying image authenticity, metadata, and timelines."),
-    ("Advanced", "Leak attribution",
-     "Attributing leaked documents using timelines and metadata.")
+    (
+        "Beginner",
+        "Username reuse",
+        "Correlating identities across platforms using usernames.",
+    ),
+    (
+        "Intermediate",
+        "Image verification",
+        "Verifying image authenticity, metadata, and timelines.",
+    ),
+    (
+        "Advanced",
+        "Leak attribution",
+        "Attributing leaked documents using timelines and metadata.",
+    ),
 ]
+
 
 def challenges_menu():
     global score, ACTIVE_CTF
@@ -473,9 +577,7 @@ IMPORTANT RULES:
     # ---- Investigator Loop ----
     while True:
         action = Prompt.ask(
-            "Options",
-            choices=["hint", "submit", "solution", "exit"],
-            default="submit"
+            "Options", choices=["hint", "submit", "solution", "exit"], default="submit"
         )
 
         # -------- HINT --------
@@ -488,7 +590,7 @@ Active OSINT CTF Challenge:
 Provide the NEXT logical OSINT hint.
 Do NOT introduce new entities.
 """,
-                mode="CTF"
+                mode="CTF",
             )
 
         # -------- SUBMIT FLAG --------
@@ -509,7 +611,7 @@ Rules:
 - Respond ONLY with CORRECT or INCORRECT
 - Then briefly explain why
 """,
-                mode="CTF"
+                mode="CTF",
             )
 
             score += 25
@@ -531,7 +633,7 @@ Reveal:
 Rules:
 - Use ONLY entities already introduced
 """,
-                mode="SOLUTION"
+                mode="SOLUTION",
             )
             break
 
@@ -540,9 +642,11 @@ Rules:
             console.print("[yellow]Exiting challenge…[/yellow]")
             break
 
+
 # ============================================================
 # MAIN MENU
 # ============================================================
+
 
 def main():
     """Main interactive menu loop."""
@@ -551,15 +655,17 @@ def main():
         console.clear()
         console.print(ASCII_ART, style="green")
 
-        console.print(Panel(
-            "[1] Web Search (DuckDuckGo)\n"
-            "[2] Ask Darkelf OSINT AI\n"
-            "[3] Username Enumeration\n"
-            "[4] Domain / IP Enrichment\n"
-            "[5] OSINT Challenges\n[q] Quit\n\n"
-            f"Network: {net_status()} | Score: {score}",
-            title=APP_NAME
-        ))
+        console.print(
+            Panel(
+                "[1] Web Search (DuckDuckGo)\n"
+                "[2] Ask Darkelf OSINT AI\n"
+                "[3] Username Enumeration\n"
+                "[4] Domain / IP Enrichment\n"
+                "[5] OSINT Challenges\n[q] Quit\n\n"
+                f"Network: {net_status()} | Score: {score}",
+                title=APP_NAME,
+            )
+        )
 
         action = Prompt.ask("Select").lower()
 
@@ -578,6 +684,7 @@ def main():
             challenges_menu()
         elif action == "q":
             sys.exit()
+
 
 # ============================================================
 # ENTRY POINT
