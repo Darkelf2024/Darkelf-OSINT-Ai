@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import sys
 import json
 import shutil
@@ -26,7 +27,7 @@ from rich.live import Live
 # ============================================================
 
 APP_NAME = "Darkelf OSINT AI"
-OLLAMA_MODEL = "llama3"
+OLLAMA_MODEL = "phi3:mini"
 DDG_LITE = "https://html.duckduckgo.com/html/"
 IPINFO_API = "https://ipinfo.io"  # API Service for IP/Domain Lookups
 BASE_DIR = Path("cases")
@@ -116,16 +117,38 @@ def ai_stream(prompt: str, mode="OSINT", return_text=False):
 
     # --- Resolve ollama binary safely ---
     ollama_bin = shutil.which("ollama")
+
     if not ollama_bin:
-        console.print("[red]Ollama not found in PATH[/red]")
+        console.print("[red]Ollama not found[/red]")
+        return None
+
+    # --- Resolve + validate executable ---
+    ollama_bin = os.path.realpath(ollama_bin)
+
+    if not os.path.isfile(ollama_bin):
+        console.print("[red]Invalid ollama binary[/red]")
+        return None
+
+    if not os.access(ollama_bin, os.X_OK):
+        console.print("[red]Ollama is not executable[/red]")
         return None
 
     # --- Validate model ---
-    ALLOWED_MODELS = {"llama3", "mistral", "mixtral"}
-    if OLLAMA_MODEL not in ALLOWED_MODELS:
-        console.print(f"[red]Invalid model: {OLLAMA_MODEL}[/red]")
-        return None
+    ALLOWED_MODELS = {
+        "llama3",
+        "mistral",
+        "mixtral",
+        "phi3:mini",
+        "phi3",
+        "qwen2.5:7b",
+    }
 
+    if OLLAMA_MODEL not in ALLOWED_MODELS:
+        console.print(
+            f"[red]Invalid model:[/red] {OLLAMA_MODEL}"
+        )
+        return None
+        
     # --- Normalize + limit prompt ---
     try:
         full_prompt = full_prompt.encode("utf-8", errors="ignore").decode()
@@ -143,6 +166,13 @@ def ai_stream(prompt: str, mode="OSINT", return_text=False):
     with Live(text, refresh_per_second=8, console=console):
         proc = None
         try:
+            safe_env = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": os.environ.get("HOME", os.path.expanduser("~")),
+                "OLLAMA_NUM_PARALLEL": "1",
+                "OLLAMA_MAX_LOADED_MODELS": "1",
+            }
+            
             proc = subprocess.Popen(  # nosec B603
                 [ollama_bin, "run", OLLAMA_MODEL],
                 stdin=subprocess.PIPE,
@@ -150,6 +180,7 @@ def ai_stream(prompt: str, mode="OSINT", return_text=False):
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                env=safe_env
             )
 
             # --- Send prompt ---
